@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
 """
+TVD — TV Argentina en vivo.
+
 Python levanta un servidor web local (solo librería estándar) que sirve una
 interfaz HTML vistosa y reproduce los canales en el navegador usando HLS.
 ffmpeg remuxea/transmite el stream a formato HLS que el navegador reproduce.
@@ -199,15 +201,47 @@ STREAM_ROOT = os.path.join(tempfile.gettempdir(), "tvd")
 os.makedirs(STREAM_ROOT, exist_ok=True)
 
 
+def _out_dir(ch_id):
+    """Directorio propio de esta instancia (prefijo con el PID): dos
+    servidores simultáneos nunca comparten el mismo live.m3u8."""
+    return os.path.join(STREAM_ROOT, f"{os.getpid()}_{ch_id}")
+
+
+def _clean_stale_dirs():
+    """Borra directorios de instancias que ya no existen."""
+    me = os.getpid()
+    try:
+        names = os.listdir(STREAM_ROOT)
+    except OSError:
+        return
+    for name in names:
+        pid = name.split("_", 1)[0]
+        if not pid.isdigit() or int(pid) == me:
+            continue
+        try:
+            os.kill(int(pid), 0)
+        except ProcessLookupError:
+            shutil.rmtree(os.path.join(STREAM_ROOT, name), ignore_errors=True)
+        except OSError:
+            pass
+
+
+_clean_stale_dirs()
+
+
 class Streamer:
     def __init__(self):
         self.lock = threading.Lock()
+        self._play_lock = threading.Lock()
         self.proc = None
         self.channel = None
         self.state = "idle"
         self.error = None
         self.logfile = None
         self.backend = "ffmpeg" if shutil.which("ffmpeg") else "nada"
+        self._respawns = 0
+        self._playing_since = 0.0
+        threading.Thread(target=self._watch_loop, daemon=True, name="tvd-watch").start()
 
     def _ffmpeg_cmd(self, url, referrer, headers, outdir, copy=True):
         cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y"]
@@ -230,7 +264,7 @@ class Streamer:
         cmd += [
             "-f", "hls",
             "-hls_time", "2",
-            "-hls_list_size", "6",
+            "-hls_list_size", "12",
             "-hls_flags", "delete_segments+append_list+omit_endlist",
             "-hls_segment_filename", os.path.join(outdir, "seg_%05d.ts"),
             os.path.join(outdir, "live.m3u8"),
@@ -249,9 +283,13 @@ class Streamer:
     def play(self, ch_id):
         if self.backend == "nada":
             raise RuntimeError("ffmpeg no está instalado o no está en el PATH")
+        with self._play_lock:
+            return self._play(ch_id)
 
+    def _play(self, ch_id):
+        """Cuerpo de play(); debe llamarse con self._play_lock tomado."""
         self.stop()
-        outdir = os.path.join(STREAM_ROOT, ch_id)
+        outdir = _out_dir(ch_id)
         shutil.rmtree(outdir, ignore_errors=True)
         os.makedirs(outdir, exist_ok=True)
         playlist = os.path.join(outdir, "live.m3u8")
@@ -282,7 +320,46 @@ class Streamer:
         with self.lock:
             self.proc = proc
             self.state = "playing"
+            self._playing_since = time.time()
         return f"/hls/{ch_id}/live.m3u8"
+
+    def _respawn(self, ch):
+        """Relanza el mismo canal si el ffmpeg murió y nadie más lo resolvió."""
+        with self._play_lock:
+            with self.lock:
+                sane = (self.channel == ch and self.state == "playing"
+                        and self.proc is not None and self.proc.poll() is not None)
+            if not sane:
+                return
+            self._play(ch)
+
+    def _watch_loop(self):
+        """Si el ffmpeg muere estando 'playing', lo relanza. Máximo 10
+        reintentos seguidos; si la señal dura >30 s, el contador se limpia."""
+        while True:
+            time.sleep(3)
+            with self.lock:
+                if self.state != "playing":
+                    continue
+                if self.proc is None or self.proc.poll() is None:
+                    if self._playing_since and time.time() - self._playing_since > 30:
+                        self._respawns = 0
+                    continue
+                ch = self.channel
+                self._respawns += 1
+                n = self._respawns
+            if n > 10:
+                with self.lock:
+                    self.state = "error"
+                    self.error = "la señal se cayó varias veces seguidas"
+                    self._respawns = 0
+                continue
+            print(f"[watchdog] ffmpeg murió en {ch}; reintento {n}/10", flush=True)
+            try:
+                self._respawn(ch)
+                print(f"[watchdog] {ch} reanudado", flush=True)
+            except Exception as e:
+                print(f"[watchdog] reintento falló: {e}", flush=True)
 
     def _wait_playlist(self, proc, playlist, timeout=15):
         deadline = time.time() + timeout
@@ -333,7 +410,9 @@ class Streamer:
     def status(self):
         with self.lock:
             alive = self.proc is not None and self.proc.poll() is None
-            state = self.state if (self.state != "playing" or alive) else "idle"
+            state = self.state
+            if state == "playing" and not alive:
+                state = "connecting"   # el watchdog va a relanzarlo
             return {
                 "state": state,
                 "channel": self.channel,
@@ -373,64 +452,84 @@ INDEX_HTML = """<!doctype html>
     --panel:#0d1116; --bevel:#242a32; --bevel-in:#0a0d11;
   }
   *{box-sizing:border-box; image-rendering:pixelated; image-rendering:crisp-edges}
-  body{margin:0;background:#000;color:var(--crt);font-family:Consolas,Monaco,'Courier New',monospace;min-height:100vh;overflow-x:hidden}
+  html,body{height:100%}
+  body{margin:0;background:#000;color:var(--crt);font-family:Consolas,Monaco,'Courier New',monospace;overflow:hidden}
   .scanlines::after{
     content:"";position:fixed;inset:0;pointer-events:none;
     background:repeating-linear-gradient(0deg,rgba(159,239,175,.03) 0px,rgba(159,239,175,.03) 1px,transparent 1px,transparent 3px);
     mix-blend-mode:screen;z-index:20;
   }
-  .retro{max-width:1360px;margin:0 auto;padding:22px;display:flex;gap:22px;align-items:flex-start}
-  .tv-frame{position:relative;background:linear-gradient(180deg,#1d222b,#0b0d12);border-radius:8px;padding:18px;border:4px solid var(--bevel);box-shadow:0 60px 120px var(--shadow),inset 0 1px 0 #3a424d,inset 0 -1px 0 #070a0d}
-  .tv-bezel{position:relative;background:radial-gradient(circle at 50% 2%,#1f232a,#070a0d 70%);border-radius:6px;padding:20px;border:2px solid var(--bevel-in)}
-  .screen{position:relative;width:100%;aspect-ratio:4/3;background:#000;border:3px solid #05070a;border-radius:2px;overflow:hidden;box-shadow:inset 0 0 40px rgba(0,0,0,.9)}
-  .screen video{width:100%;height:100%;display:block;background:#000}
+  /* ── televisor a pantalla completa ── */
+  .tv-frame{position:fixed;inset:0;display:flex;padding:8px;background:linear-gradient(180deg,#1d222b,#0b0d12);border:4px solid var(--bevel);box-shadow:inset 0 1px 0 #3a424d,inset 0 -1px 0 #070a0d}
+  .tv-bezel{position:relative;flex:1;display:flex;min-height:0;background:radial-gradient(circle at 50% 2%,#1f232a,#070a0d 70%);border:2px solid var(--bevel-in);border-radius:4px;padding:10px}
+  .screen{position:relative;flex:1;min-height:0;background:#000;border:3px solid #05070a;border-radius:2px;overflow:hidden;box-shadow:inset 0 0 40px rgba(0,0,0,.9)}
+  .screen video{width:100%;height:100%;display:block;background:#000;object-fit:contain}
   .crt-glow{position:absolute;inset:0;pointer-events:none;background:radial-gradient(circle at 50% 0%,rgba(159,239,175,.08),transparent 60%);mix-blend-mode:screen}
   #placeholder{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;text-align:center;flex-direction:column;gap:12px;color:var(--txt2);text-shadow:0 0 8px rgba(159,239,175,.15);letter-spacing:2px;text-transform:uppercase}
-  .brand{font-size:18px;color:var(--crt);text-shadow:0 0 16px rgba(159,239,175,.5)}
-  .chassis{margin-top:12px;display:flex;align-items:center;justify-content:space-between;color:var(--txt2);font-size:11px;letter-spacing:3px;text-transform:uppercase;text-shadow:0 0 6px rgba(159,239,175,.25)}
-  .controls{display:flex;flex-direction:column;gap:10px;min-width:270px;position:sticky;top:22px}
-  .panel{background:linear-gradient(180deg,#181c23,#0c1015);border:3px solid var(--bevel);border-radius:6px;padding:14px;box-shadow:0 40px 80px var(--shadow),inset 0 1px 0 #3a424d,inset 0 -1px 0 #070a0d}
+  /* ── botón burger ── */
+  .menu-btn{position:fixed;top:14px;left:14px;z-index:40;width:46px;height:46px;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:5px;padding:0;background:linear-gradient(180deg,#181c23,#0c1015);border:2px solid var(--bevel);border-radius:8px;cursor:pointer;box-shadow:0 10px 24px rgba(0,0,0,.65);transition:filter .12s ease}
+  .menu-btn:hover{filter:brightness(1.3)}
+  .menu-btn span{width:20px;height:3px;border-radius:2px;background:var(--crt);box-shadow:0 0 6px rgba(159,239,175,.45);transition:transform .16s ease,opacity .12s ease}
+  .menu-btn.open span:nth-child(1){transform:translateY(8px) rotate(45deg)}
+  .menu-btn.open span:nth-child(2){opacity:0}
+  .menu-btn.open span:nth-child(3){transform:translateY(-8px) rotate(-45deg)}
+  /* ── chip de estado flotante ── */
+  .live-chip{position:fixed;top:16px;right:16px;z-index:30;max-width:50vw;padding:8px 12px;background:rgba(7,10,13,.85);border:1px solid var(--bevel-in);border-radius:6px;font-size:9px;letter-spacing:2px;text-transform:uppercase;color:var(--txt2);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;pointer-events:none}
+  .live-chip.ok{color:var(--crt);text-shadow:0 0 8px rgba(159,239,175,.5);border-color:#1b4731}
+  .live-chip.err{color:var(--red);text-shadow:0 0 12px rgba(255,61,46,.5);border-color:#4a1712}
+  .live-chip.wait{color:var(--amber);text-shadow:0 0 10px rgba(255,182,59,.45);border-color:#4a3a12}
+  /* ── panel de canales (ocultable) ── */
+  .controls{position:fixed;top:0;left:0;height:100%;width:330px;max-width:88vw;z-index:35;display:block;overflow-y:auto;overscroll-behavior:contain;padding:74px 14px 18px;background:linear-gradient(180deg,rgba(13,17,22,.97),rgba(4,7,10,.98));border-right:2px solid var(--bevel);transform:translateX(-105%);transition:transform .18s ease}
+  .controls.open{transform:none;box-shadow:24px 0 70px rgba(0,0,0,.75)}
+  .panel{background:linear-gradient(180deg,#181c23,#0c1015);border:3px solid var(--bevel);border-radius:6px;padding:12px;box-shadow:0 40px 80px var(--shadow),inset 0 1px 0 #3a424d,inset 0 -1px 0 #070a0d}
   .panel-title{margin:0 0 10px 0;font-size:10px;letter-spacing:6px;text-transform:uppercase;color:var(--txt2);text-align:center;text-shadow:0 0 8px rgba(159,239,175,.2)}
-  .btn-grid{display:grid;grid-template-columns:repeat(2,1fr);gap:8px}
-  .ch-btn{position:relative;display:flex;align-items:center;gap:8px;padding:10px 12px;font:inherit;font-size:10px;letter-spacing:2px;text-transform:uppercase;color:var(--crt);background:linear-gradient(180deg,var(--btn-h),var(--btn));border:2px solid var(--bevel-in);border-radius:4px;text-align:left;cursor:pointer;text-shadow:0 0 8px rgba(159,239,175,.25);transition:all .08s ease}
+  .ch-search{width:100%;margin:0 0 10px 0;padding:10px 12px;font:inherit;font-size:11px;letter-spacing:2px;text-transform:uppercase;color:var(--crt);background:#070a0d;border:2px solid var(--bevel-in);border-radius:4px;outline:none;box-shadow:inset 0 2px 8px rgba(0,0,0,.6)}
+  .ch-search::placeholder{color:var(--txt2);opacity:.7;letter-spacing:2px}
+  .ch-search:focus{border-color:#1b4731;box-shadow:inset 0 2px 8px rgba(0,0,0,.6),0 0 12px rgba(159,239,175,.15)}
+  .ch-search::-webkit-search-cancel-button{-webkit-appearance:none;appearance:none;color:var(--txt2);cursor:pointer}
+  .no-results{display:none;padding:14px 0 4px;text-align:center;font-size:9px;letter-spacing:3px;text-transform:uppercase;color:var(--red);text-shadow:0 0 10px rgba(255,61,46,.5)}
+  .btn-grid{display:grid;grid-template-columns:repeat(2,1fr);gap:7px}
+  .ch-btn{position:relative;display:flex;align-items:center;gap:6px;padding:9px 8px;font:inherit;font-size:9px;letter-spacing:1px;text-transform:uppercase;color:var(--crt);background:linear-gradient(180deg,var(--btn-h),var(--btn));border:2px solid var(--bevel-in);border-radius:4px;text-align:left;cursor:pointer;text-shadow:0 0 8px rgba(159,239,175,.25);transition:all .08s ease;overflow:hidden;white-space:nowrap}
   .ch-btn:hover{filter:brightness(1.25)}
   .ch-btn:active{transform:translateY(1px)}
   .ch-btn.active{color:var(--tube);background:linear-gradient(180deg,var(--crt2),var(--crt));box-shadow:0 0 18px rgba(159,239,175,.4);text-shadow:none}
-  .led{width:6px;height:6px;border-radius:50%;background:var(--btn);border:1px solid #050608;box-shadow:inset 0 1px 0 rgba(255,255,255,.1)}
+  .led{flex:none;width:6px;height:6px;border-radius:50%;background:var(--btn);border:1px solid #050608;box-shadow:inset 0 1px 0 rgba(255,255,255,.1)}
   .ch-btn.active .led{background:var(--red);box-shadow:0 0 10px var(--red)}
   .stop-btn{margin-top:8px;width:100%;padding:10px;font:inherit;font-size:10px;letter-spacing:4px;text-transform:uppercase;color:var(--crt);background:linear-gradient(180deg,#262b33,#151a21);border:2px solid var(--bevel-in);border-radius:4px;cursor:pointer;text-shadow:0 0 8px rgba(159,239,175,.25)}
   .stop-btn:active{transform:translateY(1px);filter:brightness(1.25)}
-  .status-bar{margin-top:12px;display:flex;align-items:center;justify-content:space-between;padding:8px 10px;background:#070a0d;border:1px solid var(--bevel-in);border-radius:4px;font-size:9px;letter-spacing:3px;text-transform:uppercase;color:var(--txt2)}
+  .status-bar{margin-top:12px;display:flex;align-items:center;justify-content:space-between;padding:8px 10px;background:#070a0d;border:1px solid var(--bevel-in);border-radius:4px;font-size:9px;letter-spacing:2px;text-transform:uppercase;color:var(--txt2)}
   .status-bar .live{color:var(--txt2)}
   .status-bar.ok .live{color:var(--crt);text-shadow:0 0 8px rgba(159,239,175,.5)}
   .status-bar.err .live{color:var(--red);text-shadow:0 0 12px rgba(255,61,46,.6)}
   .status-bar.wait .live{color:var(--amber);text-shadow:0 0 10px rgba(255,182,59,.5)}
   .knobs{display:flex;gap:10px;margin-top:12px;justify-content:center}
-  .knob{width:36px;height:36px;border-radius:50%;background:radial-gradient(circle at 50% 35%,#3a424d,#0f1318);border:2px solid var(--bevel-in);box-shadow:0 6px 12px rgba(0,0,0,.5),inset 0 1px 0 rgba(255,255,255,.15)}
-  @media(max-width:1100px){.retro{flex-direction:column}.controls{position:static;width:100%}.btn-grid{grid-template-columns:repeat(4,1fr)}}
-  @media(max-width:680px){.btn-grid{grid-template-columns:repeat(2,1fr)}}
+  .knob{width:32px;height:32px;border-radius:50%;background:radial-gradient(circle at 50% 35%,#3a424d,#0f1318);border:2px solid var(--bevel-in);box-shadow:0 6px 12px rgba(0,0,0,.5),inset 0 1px 0 rgba(255,255,255,.15)}
+  @media(max-width:520px){.controls{width:100%;max-width:100%}.btn-grid{grid-template-columns:1fr}.live-chip{max-width:42vw}}
 </style>
 </head>
-<body >
-<div class="retro">
-  <div class="tv-frame">
-    <div class="tv-bezel">
-      <div class="screen">
-        <video id="video" muted autoplay playsinline webkit-playsinline x5-playsinline></video>
-        <div id="placeholder"></div>
-        <div class="crt-glow"></div>
-      </div>
+<body class="scanlines">
+<div class="tv-frame">
+  <div class="tv-bezel">
+    <div class="screen">
+      <video id="video" muted autoplay playsinline webkit-playsinline x5-playsinline></video>
+      <div id="placeholder"></div>
+      <div class="crt-glow"></div>
     </div>
-    
   </div>
-  <aside class="controls">
-    <div class="panel">
-      
-      <div class="btn-grid">
-        __CHANNELS__
-      </div>
-      <button class="stop-btn" onclick="stopStream()">■</button>
+</div>
+
+<button class="menu-btn" id="menu-btn" aria-label="Abrir canales"><span></span><span></span><span></span></button>
+<div class="live-chip" id="live-chip">SIN SEÑAL</div>
+
+<aside class="controls" id="controls">
+  <div class="panel">
+    <div class="panel-title">CANALES</div>
+    <input class="ch-search" id="ch-search" type="search" placeholder="BUSCAR CANAL..." autocomplete="off" spellcheck="false">
+    <div class="btn-grid">
+      __CHANNELS__
     </div>
+    <div class="no-results" id="no-results">SIN RESULTADOS</div>
+    <button class="stop-btn" onclick="stopStream()">■</button>
     <div class="status-bar" id="statusbar" style="display:none">
       <span class="live" id="status">SIN SEÑAL</span>
       <span class="live" id="backend">__BACKEND__</span>
@@ -440,76 +539,188 @@ INDEX_HTML = """<!doctype html>
       <div class="knob"></div>
       <div class="knob"></div>
     </div>
-  </aside>
-</div>
+  </div>
+</aside>
 <script>
 const video = document.getElementById('video');
 const ph = document.getElementById('placeholder');
 const statusBar = document.getElementById('statusbar');
 const statusEl = document.getElementById('status');
-let hls = null;
+const chip = document.getElementById('live-chip');
+const controls = document.getElementById('controls');
+const menuBtn = document.getElementById('menu-btn');
+const search = document.getElementById('ch-search');
+const noResults = document.getElementById('no-results');
+let hls = null, soundOn = false;
+let currentCh = null, currentName = '', busy = false, attempts = 0, nonPlay = 0, coolReset = false;
+let lastPos = 0, lastMove = Date.now(), lastHlsFix = 0;
+
+document.addEventListener('pointerdown', ()=>{ soundOn = true; video.muted = false; }, true);
+
+function filterChannels(){
+  const q = search.value.trim().toLowerCase();
+  let vis = 0;
+  document.querySelectorAll('.ch-btn').forEach(b=>{
+    const hit = !q || (b.dataset.name + ' ' + b.dataset.ch).toLowerCase().indexOf(q) !== -1;
+    b.style.display = hit ? '' : 'none';
+    if(hit) vis++;
+  });
+  noResults.style.display = (q && !vis) ? 'block' : 'none';
+}
+search.addEventListener('input', filterChannels);
+
+function openMenu(){ controls.classList.add('open'); menuBtn.classList.add('open'); search.focus({preventScroll:true}); }
+function closeMenu(){ controls.classList.remove('open'); menuBtn.classList.remove('open'); }
+function toggleMenu(){ controls.classList.contains('open') ? closeMenu() : openMenu(); }
+menuBtn.addEventListener('click', (e)=>{ e.stopPropagation(); toggleMenu(); });
+document.querySelector('.tv-frame').addEventListener('click', closeMenu);
+document.addEventListener('keydown', (e)=>{
+  if(e.key === 'Escape'){
+    if(search.value){ search.value = ''; filterChannels(); return; }
+    closeMenu();
+  }
+});
 
 function setStatus(text, cls){
-  statusEl.textContent = text || 'SIN SEÑAL';
-  statusBar.className = 'status-bar ' + (cls||'');
+  const t = text || 'SIN SEÑAL';
+  statusEl.textContent = t;
+  statusBar.className = 'status-bar ' + (cls || '');
   statusBar.style.display = 'flex';
+  chip.textContent = t;
+  chip.className = 'live-chip ' + (cls || '');
+}
+
+function markActive(ch){
+  document.querySelectorAll('.ch-btn').forEach(b=>b.classList.toggle('active', b.dataset.ch === ch));
 }
 
 function loadStream(url){
-  if(hls){ hls.destroy(); hls=null; }
-  ph.style.display='none';
-  video.muted=false;
+  if(hls){ hls.destroy(); hls = null; }
+  ph.style.display = 'none';
+  video.muted = !soundOn;
+  lastPos = video.currentTime;
+  lastMove = Date.now();
   if(window.Hls && Hls.isSupported()){
-    hls=new Hls({lowLatencyMode:true,liveSyncDurationCount:3,liveDurationInfinity:true});
+    hls = new Hls({lowLatencyMode:true, liveSyncDurationCount:3, liveDurationInfinity:true});
     hls.loadSource(url);
     hls.attachMedia(video);
-    hls.on(Hls.Events.MANIFEST_PARSED,()=>video.play().catch(()=>{}));
-    hls.on(Hls.Events.ERROR,(e,d)=>{if(d&&d.fatal)setStatus('ERROR DE REPRODUCCIÓN','err');});
+    hls.on(Hls.Events.MANIFEST_PARSED, ()=>{ lastMove = Date.now(); video.play().catch(()=>{}); });
+    hls.on(Hls.Events.ERROR, (e,d)=>{
+      if(!d || !d.fatal) return;
+      const now = Date.now();
+      if(now - lastHlsFix > 4000){
+        lastHlsFix = now;
+        if(d.type === Hls.ErrorTypes.NETWORK_ERROR){ setStatus('RECONECTANDO...','wait'); hls.startLoad(); return; }
+        if(d.type === Hls.ErrorTypes.MEDIA_ERROR){ setStatus('RECONECTANDO...','wait'); hls.recoverMediaError(); return; }
+      }
+      setStatus('ERROR DE REPRODUCCIÓN','err');
+      retry();
+    });
   } else if(video.canPlayType('application/vnd.apple.mpegurl')){
-    video.src=url; video.play().catch(()=>{});
+    video.src = url; video.play().catch(()=>{});
   } else {
     setStatus('NAVEGADOR SIN SOPORTE HLS','err');
   }
 }
 
-async function playChannel(btn){
-  const ch=btn.dataset.ch, name=btn.dataset.name;
-  document.querySelectorAll('.ch-btn').forEach(b=>b.classList.toggle('active',b===btn));
-  setStatus('CONECTANDO '+name+'...','wait');
+async function startChannel(ch, name){
+  if(busy) return;
+  busy = true;
+  currentCh = ch; currentName = name;
+  setStatus('CONECTANDO ' + name + '...','wait');
   try{
-    const res=await fetch('/play/'+ch);
-    const data=await res.json();
-    if(!data.ok){ setStatus('ERROR: '+(data.error||'NO SE PUDO ABRIR'),'err'); return; }
+    const res = await fetch('/play/' + ch);
+    const data = await res.json();
+    if(!data.ok){ setStatus('ERROR: ' + (data.error || 'NO SE PUDO ABRIR'),'err'); busy = false; retry(); return; }
     loadStream(data.playlist);
-    setStatus('EN VIVO — '+name,'ok');
-  }catch(e){ setStatus('ERROR DE CONEXIÓN','err'); }
+    nonPlay = 0;
+    setStatus('EN VIVO — ' + name,'ok');
+  }catch(e){ setStatus('ERROR DE CONEXIÓN','err'); busy = false; retry(); return; }
+  busy = false;
+}
+
+function armCool(){
+  if(!coolReset){ coolReset = true; setTimeout(()=>{ attempts = 0; coolReset = false; }, 20000); }
+}
+
+function retry(){
+  if(busy || !currentCh) return;
+  if(attempts >= 5){ armCool(); return; }
+  attempts++;
+  setTimeout(()=>{ if(!busy && currentCh) startChannel(currentCh, currentName); }, 1500 * attempts);
+}
+
+async function playChannel(btn){
+  markActive(btn.dataset.ch);
+  closeMenu();
+  await startChannel(btn.dataset.ch, btn.dataset.name);
 }
 
 async function stopStream(){
-  try{await fetch('/stop');}catch(e){}
-  if(hls){hls.destroy();hls=null;}
-  video.removeAttribute('src');video.load();video.muted=true;
-  ph.style.display='flex';
+  try{ await fetch('/stop'); }catch(e){}
+  currentCh = null; attempts = 0; nonPlay = 0; busy = false;
+  if(hls){ hls.destroy(); hls = null; }
+  video.removeAttribute('src'); video.load(); video.muted = true;
+  ph.style.display = 'flex';
   document.querySelectorAll('.ch-btn').forEach(b=>b.classList.remove('active'));
   setStatus('DETENIDO','');
 }
 
 async function refresh(){
-  try{
-    const s=await (await fetch('/status')).json();
-    if(s.state==='error') setStatus('ERROR: '+(s.error||'STREAM'),'err');
-    else if(s.state==='connecting') setStatus('CONECTANDO...','wait');
-  }catch(e){}
+  let s = null;
+  try{ s = await (await fetch('/status')).json(); }catch(e){ return; }
+  if(busy) return;
+  if(!currentCh){
+    if(s.state === 'error') setStatus('ERROR: ' + (s.error || 'STREAM'),'err');
+    return;
+  }
+  if(s.state === 'playing'){
+    nonPlay = 0; attempts = 0;
+    setStatus('EN VIVO — ' + (s.name || currentName),'ok');
+    return;
+  }
+  if(s.state === 'connecting'){ nonPlay = 0; setStatus('RECONECTANDO...','wait'); return; }
+  if(s.state === 'error'){
+    setStatus('ERROR: ' + (s.error || 'STREAM') + ' — REINTENTANDO','err');
+    retry(); return;
+  }
+  nonPlay++;
+  if(nonPlay >= 2){ setStatus('SEÑAL INTERRUMPIDA — RECONECTANDO...','wait'); retry(); }
 }
-setInterval(refresh,2500);
+setInterval(refresh, 2500);
+
+/* si el video se congela >10 s con estado 'playing', recarga el stream */
+setInterval(()=>{
+  if(!currentCh || busy || document.hidden) return;
+  if(video.readyState >= 3 && video.currentTime !== lastPos){
+    lastPos = video.currentTime;
+    lastMove = Date.now();
+    return;
+  }
+  if(Date.now() - lastMove > 10000){
+    lastMove = Date.now();
+    if(attempts < 5){
+      attempts++;
+      setStatus('RECONECTANDO SEÑAL...','wait');
+      startChannel(currentCh, currentName);
+    } else { armCool(); }
+  }
+}, 1000);
 
 function toggleFs(){
-  const el=document.getElementById('video');
-  if(document.fullscreenElement){document.exitFullscreen().catch(()=>{});} else {el.requestFullscreen({navigationUI:'hide'}).catch(()=>{});}
+  const el = document.getElementById('video');
+  if(document.fullscreenElement){ document.exitFullscreen().catch(()=>{}); } else { el.requestFullscreen({navigationUI:'hide'}).catch(()=>{}); }
 }
-document.getElementById('video').addEventListener('dblclick', toggleFs);
-document.querySelector(".tv-frame").addEventListener("dblclick", toggleFs);
-document.addEventListener('keydown', (e)=>{if(e.key==='f'||e.key==='F') toggleFs();});
+video.addEventListener('dblclick', toggleFs);
+document.querySelector('.tv-frame').addEventListener('dblclick', toggleFs);
+document.addEventListener('keydown', (e)=>{ if(e.key === 'f' || e.key === 'F') toggleFs(); });
+
+/* canal por defecto al iniciar */
+(function(){
+  const btn = document.querySelector('.ch-btn[data-ch="telefe"]');
+  if(btn) btn.classList.add('active');
+  startChannel('telefe', 'Telefe');
+})();
 </script>
 </body>
 </html>
@@ -584,7 +795,7 @@ class Handler(BaseHTTPRequestHandler):
         if ch_id not in CHANNELS or not fname.endswith((".m3u8", ".ts")):
             self._send(404, "no encontrado", "text/plain; charset=utf-8")
             return
-        fpath = os.path.join(STREAM_ROOT, ch_id, os.path.basename(fname))
+        fpath = os.path.join(_out_dir(ch_id), os.path.basename(fname))
         if not os.path.exists(fpath):
             self._send(404, "no encontrado", "text/plain; charset=utf-8")
             return
@@ -602,7 +813,7 @@ def run_server():
     port = int(os.environ.get("PORT", "8000"))
     httpd = ThreadingHTTPServer(("0.0.0.0", port), Handler)
     print("=" * 50)
-    print("  TVD")
+    print("  TVD — TV Argentina en vivo")
     print("=" * 50)
     print(f"  Motor de video: {STREAMER.backend}")
     print(f"  Abrí la interfaz en:  http://0.0.0.0:{port}")
