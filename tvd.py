@@ -1,7 +1,5 @@
 #!/usr/bin/env python3
 """
-mamirTV — TV Argentina en vivo.
-
 Python levanta un servidor web local (solo librería estándar) que sirve una
 interfaz HTML vistosa y reproduce los canales en el navegador usando HLS.
 ffmpeg remuxea/transmite el stream a formato HLS que el navegador reproduce.
@@ -197,7 +195,7 @@ def resolve_stream(ch_id):
 
 
 # ─── Streaming HLS ──────────────────────────────────────────────────────
-STREAM_ROOT = os.path.join(tempfile.gettempdir(), "mamirtv")
+STREAM_ROOT = os.path.join(tempfile.gettempdir(), "tvd")
 os.makedirs(STREAM_ROOT, exist_ok=True)
 
 
@@ -365,7 +363,7 @@ INDEX_HTML = """<!doctype html>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>mamirTV</title>
+<title>TVD</title>
 <script src="https://cdn.jsdelivr.net/npm/hls.js@1"></script>
 <style>
   :root{
@@ -604,7 +602,7 @@ def run_server():
     port = int(os.environ.get("PORT", "8000"))
     httpd = ThreadingHTTPServer(("0.0.0.0", port), Handler)
     print("=" * 50)
-    print("  mamirTV — TV Argentina en vivo")
+    print("  TVD")
     print("=" * 50)
     print(f"  Motor de video: {STREAMER.backend}")
     print(f"  Abrí la interfaz en:  http://0.0.0.0:{port}")
